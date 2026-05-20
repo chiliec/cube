@@ -22,6 +22,7 @@ import {
   redactSqlLiterals,
   rowsToColumnar,
 } from '@cubejs-backend/native';
+import type { SqlFilterItem, SqlFiltersResponse } from '@cubejs-backend/native';
 import type {
   Application as ExpressApplication,
   ErrorRequestHandler,
@@ -479,6 +480,26 @@ class ApiGateway {
 
       await this.sql({
         query: req.body.query,
+        context: req.context,
+        res: this.resToResultFn(res)
+      });
+    }));
+
+    app.get(`${this.basePath}/v1/sql-filters`, userMiddlewares, userAsyncHandler(async (req: any, res) => {
+      await this.getSqlFilters({
+        query: req.query.query,
+        context: req.context,
+        res: this.resToResultFn(res)
+      });
+    }));
+
+    app.post(`${this.basePath}/v1/sql-filters`, jsonParser, userMiddlewares, userAsyncHandler(async (req, res) => {
+      await this.modifySqlFilters({
+        query: req.body.query,
+        add: req.body.add,
+        set: req.body.set,
+        delete: req.body.delete,
+        replace: req.body.replace,
         context: req.context,
         res: this.resToResultFn(res)
       });
@@ -1543,6 +1564,129 @@ class ApiGateway {
       const result = await this.sqlServer.sql4sql(query, disablePostProcessing, context.securityContext);
 
       await res({ sql: result });
+    } catch (e: any) {
+      this.handleError({
+        e,
+        context,
+        query,
+        res,
+      });
+    }
+  }
+
+  /**
+   * Responds with the result of a SQL filters operation: an in-band
+   * `{ status: 'error', error }` is a 400. Which failures arrive in-band and
+   * which are thrown is decided by `in_band_or_thrown` in the native layer.
+   */
+  protected async resSqlFilters(result: SqlFiltersResponse, res: ResponseResultFn) {
+    if (result.status === 'error') {
+      await res(result, { status: 400 });
+      return;
+    }
+
+    await res(result);
+  }
+
+  /**
+   * Returns the list of Cube filters of a SQL query in Cube query format,
+   * extracted from the logical plan of the query.
+   */
+  protected async getSqlFilters({
+    query,
+    context,
+    res,
+  }: { query: string } & BaseRequest) {
+    try {
+      await this.assertApiScope('sql', context.securityContext);
+
+      if (typeof query !== 'string' || !query.trim()) {
+        throw new UserError('query parameter must be a non-empty string');
+      }
+
+      const result = await this.sqlServer.getSqlFilters(query, context.securityContext);
+
+      await this.resSqlFilters(result, res);
+    } catch (e: any) {
+      this.handleError({
+        e,
+        context,
+        query,
+        res,
+      });
+    }
+  }
+
+  /**
+   * Rewrites the filters of a SQL API query with exactly one of `add`, `set`,
+   * `delete` or `replace`. The semantics live in cubesql's `ast_conv` and are
+   * documented at `reference/core-data-apis/rest-api/reference.mdx`.
+   */
+  protected async modifySqlFilters({
+    query,
+    add,
+    set,
+    delete: deleteFilters,
+    replace,
+    context,
+    res,
+  }: { query: string, add?: unknown, set?: unknown, delete?: unknown, replace?: unknown } & BaseRequest) {
+    try {
+      await this.assertApiScope('sql', context.securityContext);
+
+      if (typeof query !== 'string' || !query.trim()) {
+        throw new UserError('query parameter must be a non-empty string');
+      }
+
+      const requestedOps = [add, set, deleteFilters, replace].filter((op) => op !== undefined);
+      if (requestedOps.length !== 1) {
+        throw new UserError('Exactly one of add, set, delete or replace parameters is required');
+      }
+
+      // The shape alone is checked here; the filter count is bounded by the
+      // native layer, which answers in-band and lands on the same 400
+      const assertFilterArray = (filters: unknown, name: string): SqlFilterItem[] => {
+        if (!Array.isArray(filters)) {
+          throw new UserError(`${name} parameter must be an array of filters`);
+        }
+
+        return filters;
+      };
+
+      if (add !== undefined) {
+        const result = await this.sqlServer.addSqlFilters(query, assertFilterArray(add, 'add'), context.securityContext);
+
+        await this.resSqlFilters(result, res);
+        return;
+      }
+
+      if (set !== undefined) {
+        const result = await this.sqlServer.setSqlFilters(query, assertFilterArray(set, 'set'), context.securityContext);
+
+        await this.resSqlFilters(result, res);
+        return;
+      }
+
+      if (deleteFilters !== undefined) {
+        const result = await this.sqlServer.deleteSqlFilters(query, assertFilterArray(deleteFilters, 'delete'), context.securityContext);
+
+        await this.resSqlFilters(result, res);
+        return;
+      }
+
+      if (typeof replace !== 'object' || replace === null || Array.isArray(replace)) {
+        throw new UserError('replace parameter must be an object with old and new filter arrays');
+      }
+
+      const { old: oldFilters, new: newFilters } = replace as Record<string, unknown>;
+      const result = await this.sqlServer.replaceSqlFilters(
+        query,
+        assertFilterArray(oldFilters, 'replace.old'),
+        assertFilterArray(newFilters, 'replace.new'),
+        context.securityContext,
+      );
+
+      await this.resSqlFilters(result, res);
     } catch (e: any) {
       this.handleError({
         e,
